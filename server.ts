@@ -188,7 +188,7 @@ async function startServer() {
                         + 'VERSION:3.0\n' 
                         + 'FN:Official Owner\n' 
                         + 'ORG:ellbot_MK;\n'
-                        + `TEL;type=CELL;type=VOICE;waid=6282123456789:+6282123456789\n` 
+                        + `TEL;type=CELL;type=VOICE;waid=6281245695410:+6281245695410\n` 
                         + 'END:VCARD';
                     
                     await sock.sendMessage(jid, { 
