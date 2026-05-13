@@ -21,8 +21,20 @@ import axios from "axios";
 import { Sticker, createSticker, StickerTypes } from "wa-sticker-formatter";
 
 // Initialize Gemini
-const genAI = new (GoogleGenAI as any)(process.env.GEMINI_API_KEY || "");
-const model = (genAI as any).getGenerativeModel({ model: "gemini-1.5-flash" });
+const apiKey = process.env.GEMINI_API_KEY || "";
+let model: any = null;
+
+if (apiKey) {
+    try {
+        const genAI = new (GoogleGenAI as any)(apiKey);
+        model = (genAI as any).getGenerativeModel({ model: "gemini-1.5-flash" });
+        console.log("Gemini AI initialized.");
+    } catch (e) {
+        console.error("Gemini Init Error:", e);
+    }
+} else {
+    console.warn("GEMINI_API_KEY is missing.");
+}
 
 // Persistent Settings
 const SETTINGS_FILE = "./bot_settings.json";
@@ -85,6 +97,8 @@ async function startServer() {
         connectionStatus = "Connecting";
         io.emit("status", connectionStatus);
 
+        const { version } = await fetchLatestBaileysVersion();
+
         sock = makeWASocket({
             version,
             logger: pino({ level: "silent" }),
@@ -94,7 +108,8 @@ async function startServer() {
                 keys: makeCacheableSignalKeyStore(state.keys, pino({ level: "silent" })),
             },
             browser: Browsers.macOS("Desktop"),
-            syncFullHistory: false
+            syncFullHistory: false,
+            markOnlineOnConnect: true,
         });
 
         sock.ev.on("connection.update", async (update: any) => {
@@ -109,7 +124,7 @@ async function startServer() {
 
             if (connection === "close") {
                 const shouldReconnect = (lastDisconnect?.error as Boom)?.output?.statusCode !== DisconnectReason.loggedOut;
-                console.log("Connection closed due to ", lastDisconnect?.error, ", reconnecting ", shouldReconnect);
+                console.log("Connection closed, reconnecting: ", shouldReconnect);
                 qrCode = null;
                 connectionStatus = "Disconnected";
                 io.emit("status", connectionStatus);
@@ -127,78 +142,82 @@ async function startServer() {
         sock.ev.on("creds.update", saveCreds);
 
         sock.ev.on("messages.upsert", async (m: any) => {
-            const msg = m.messages[0];
-            if (!msg.message || msg.key.fromMe) return;
+            try {
+                const msg = m.messages[0];
+                if (!msg.message || (msg.key && msg.key.fromMe)) return;
 
-            const jid = msg.key.remoteJid;
-            const text = msg.message.conversation || 
-                         msg.message.extendedTextMessage?.text || 
-                         msg.message.imageMessage?.caption || 
-                         msg.message.videoMessage?.caption;
+                const jid = msg.key.remoteJid;
+                const text = msg.message.conversation || 
+                             msg.message.extendedTextMessage?.text || 
+                             msg.message.imageMessage?.caption || 
+                             msg.message.videoMessage?.caption;
 
-            const isGroup = jid.endsWith("@g.us");
-            const sender = isGroup ? msg.key.participant : jid;
-            const pushname = msg.pushName || "User";
+                if (!text) return;
 
-            if (!text) return;
+                const isGroup = jid.endsWith("@g.us");
+                const sender = isGroup ? msg.key.participant : jid;
+                const pushname = msg.pushName || "User";
 
-            console.log(`Message from ${pushname} (${jid}): ${text}`);
+                console.log(`[MSG] from ${pushname} (${jid}): ${text}`);
 
-            const prefix = process.env.VITE_BOT_PREFIX || "!";
-            if (!text.startsWith(prefix)) return;
+                const prefix = process.env.VITE_BOT_PREFIX || "!";
+                const reply = async (content: string) => {
+                    await sock.sendMessage(jid, { text: content }, { quoted: msg });
+                };
 
-            const [command, ...args] = text.slice(prefix.length).trim().split(/\s+/);
-            const cmd = command.toLowerCase();
-            const q = args.join(" ");
+                // 👑 OWNER COMMAND (Auto Share Contact)
+                if (text.toLowerCase() === prefix + "owner" || text.toLowerCase() === "owner") {
+                    const vcard = 'BEGIN:VCARD\n'
+                        + 'VERSION:3.0\n' 
+                        + 'FN:Official Owner\n' 
+                        + 'ORG:ellbot_MK;\n'
+                        + `TEL;type=CELL;type=VOICE;waid=6282123456789:+6282123456789\n` 
+                        + 'END:VCARD';
+                    
+                    await sock.sendMessage(jid, { 
+                        contacts: { 
+                            displayName: 'Official Owner', 
+                            contacts: [{ vcard }] 
+                        }
+                    }, { quoted: msg });
+                    return;
+                }
 
-            const reply = async (content: string) => {
-                await sock.sendMessage(jid, { text: content }, { quoted: msg });
-            };
+                // 📂 PLUGIN LOADER LOGIC
+                if (text.startsWith(prefix)) {
+                    const [command, ...args] = text.slice(prefix.length).trim().split(/\s+/);
+                    const cmd = command.toLowerCase();
+                    const q = args.join(" ");
 
-            // 👑 OWNER COMMAND (Auto Share Contact)
-            if (cmd === "owner") {
-                const vcard = 'BEGIN:VCARD\n'
-                    + 'VERSION:3.0\n' 
-                    + 'FN:Official Owner\n' 
-                    + 'ORG:WhatsApp AI Pro;\n'
-                    + `TEL;type=CELL;type=VOICE;waid=6282123456789:+6282123456789\n` // Ganti dengan nomor kamu
-                    + 'END:VCARD';
-                
-                await sock.sendMessage(jid, { 
-                    contacts: { 
-                        displayName: 'Official Owner', 
-                        contacts: [{ vcard }] 
-                    }
-                }, { quoted: msg });
-                return;
-            }
-
-            // 📂 PLUGIN LOADER LOGIC
-            const pluginsDir = path.join(process.cwd(), "plugins");
-            if (fs.existsSync(pluginsDir)) {
-                const files = fs.readdirSync(pluginsDir);
-                for (const file of files) {
-                    if (file.endsWith(".ts") || file.endsWith(".js")) {
-                        try {
-                            const plugin = await import(path.join(pluginsDir, file));
-                            if (plugin.default && typeof plugin.default === "function") {
-                                const result = await plugin.default({
-                                    cmd, q, args, sock, msg, jid, pushname, prefix, isGroup, sender, model, botSettings, saveSettings, saveCV, reply, downloadMediaMessage
-                                });
-                                if (result) return; // Stop if plugin handled it
+                    const pluginsDir = path.join(process.cwd(), "plugins");
+                    if (fs.existsSync(pluginsDir)) {
+                        const files = fs.readdirSync(pluginsDir);
+                        for (const file of files) {
+                            if (file.endsWith(".ts") || file.endsWith(".js")) {
+                                try {
+                                    const plugin = await import(path.join(pluginsDir, file));
+                                    if (plugin.default && typeof plugin.default === "function") {
+                                        const result = await plugin.default({
+                                            cmd, q, args, sock, msg, jid, pushname, prefix, isGroup, sender, model, botSettings, saveSettings, saveCV, reply, downloadMediaMessage
+                                        });
+                                        if (result) return; 
+                                    }
+                                } catch (e) {
+                                    console.error(`Error loading plugin ${file}:`, e);
+                                }
                             }
-                        } catch (e) {
-                            console.error(`Error loading plugin ${file}:`, e);
                         }
                     }
                 }
-            }
 
-            // AUTO-REPLY LOGIC (If not a command and in private chat)
-            if (!isGroup && !text.startsWith(prefix)) {
-                await reply(`Halo kak *${pushname}*! 👋\n\nSaya adalah *ellbot_MK*, asisten WhatsApp AI Anda. Ketik *${prefix}menu* untuk melihat daftar fitur yang tersedia.\n\nContoh: *${prefix}ai Apa itu AI?*`);
+                // AUTO-REPLY LOGIC (If not a command and in private chat)
+                if (!isGroup && !text.startsWith(prefix)) {
+                    console.log(`[AUTO-REPLY] to ${jid}`);
+                    await reply(`Halo kak *${pushname}*! 👋\n\nSaya adalah *ellbot_MK*, asisten WhatsApp AI Anda. Ketik *${prefix}menu* untuk melihat daftar fitur yang tersedia.\n\nContoh: *${prefix}ai Apa itu AI?*`);
+                }
+            } catch (err) {
+                console.error("Handler Error:", err);
             }
-
         });
     };
 
